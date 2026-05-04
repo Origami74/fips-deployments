@@ -155,11 +155,13 @@ jobs:
   # ${{ secrets[var] }}) is omitted — secrets are referenced directly. To add
   # more servers, restore the resolve-step pattern from git history.
   #
-  # Required secrets:
-  #   SSH_PRIVATE_KEY              — SSH private key
-  #   DEPLOY_USER_FIPS_PROD_US_1   — SSH login user
-  #   DEPLOY_HOST_FIPS_PROD_US_1   — hostname or IP
-  #   NSEC_FIPS_PROD_US_1          — 64-char hex nsec
+  # Required (under environment "production"):
+  #   secrets:
+  #     SSH_PRIVATE_KEY              — SSH private key
+  #     NSEC_FIPS_PROD_US_1          — 64-char hex nsec
+  #   vars:
+  #     DEPLOY_USER_FIPS_PROD_US_1   — SSH login user
+  #     DEPLOY_HOST_FIPS_PROD_US_1   — hostname or IP
   # ---------------------------------------------------------------------------
   deploy:
     name: Deploy to ${{ matrix.name }}
@@ -177,8 +179,8 @@ jobs:
             peers: ""
 
     env:
-      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST_FIPS_PROD_US_1 }}
-      DEPLOY_USER: ${{ secrets.DEPLOY_USER_FIPS_PROD_US_1 }}
+      DEPLOY_HOST: ${{ vars.DEPLOY_HOST_FIPS_PROD_US_1 }}
+      DEPLOY_USER: ${{ vars.DEPLOY_USER_FIPS_PROD_US_1 }}
       NSEC_VALUE:  ${{ secrets.NSEC_FIPS_PROD_US_1 }}
 
     steps:
