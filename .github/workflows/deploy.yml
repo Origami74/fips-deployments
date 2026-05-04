@@ -318,13 +318,16 @@ jobs:
           # the host's public IP (fips needs a concrete reachable address
           # for its Nostr advert; bridge networking would only expose the
           # container's private IP). Drops the need for -p port mappings.
+          # Note: --sysctl net.ipv6.conf.* is not allowed with --network host
+          # (those sysctls live in the network namespace). The host's IPv6
+          # setting now applies directly; ensure IPv6 is enabled on the host
+          # if needed (sysctl net.ipv6.conf.all.disable_ipv6=0).
           sudo docker run -d \
               --name "$CONTAINER_NAME" \
               --restart unless-stopped \
               --cap-add NET_ADMIN \
               --device /dev/net/tun:/dev/net/tun \
               --network host \
-              --sysctl net.ipv6.conf.all.disable_ipv6=0 \
               -v "$CONFIG_DIR/fips.yaml:/etc/fips/fips.yaml:ro" \
               "$IMAGE_NAME:$IMAGE_TAG"
 
