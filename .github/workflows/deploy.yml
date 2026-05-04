@@ -60,7 +60,7 @@ jobs:
 
       - name: Check deployment marker cache
         id: cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: .deployed-marker
           key: fips-deployed-${{ steps.sha.outputs.sha }}
@@ -90,14 +90,14 @@ jobs:
     if: needs.resolve.outputs.should_deploy == 'true'
     steps:
       - name: Check out fips source at ${{ needs.resolve.outputs.sha }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ env.FIPS_REPO }}
           ref: ${{ needs.resolve.outputs.sha }}
           path: fips-src
 
       - name: Check out fips-deployments (this repo) for the Dockerfile
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: fips-deployments
 
@@ -110,7 +110,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Cargo registry + build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -130,7 +130,7 @@ jobs:
           cp fips-src/target/release/fipstop fips-deployments/docker/fipstop
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Build Docker image
         run: docker build --platform linux/amd64 -t ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} fips-deployments/docker
@@ -141,7 +141,7 @@ jobs:
           ls -lh /tmp/fips-node.tar.gz
 
       - name: Upload Docker image artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: docker-image
           path: /tmp/fips-node.tar.gz
@@ -182,14 +182,28 @@ jobs:
       NSEC_VALUE:  ${{ secrets.NSEC_FIPS_PROD_US_1 }}
 
     steps:
+      - name: Validate required secrets are present
+        run: |
+          missing=()
+          [ -z "${DEPLOY_HOST}"  ] && missing+=("DEPLOY_HOST_FIPS_PROD_US_1")
+          [ -z "${DEPLOY_USER}"  ] && missing+=("DEPLOY_USER_FIPS_PROD_US_1")
+          [ -z "${NSEC_VALUE}"   ] && missing+=("NSEC_FIPS_PROD_US_1")
+          [ -z "${{ secrets.SSH_PRIVATE_KEY }}" ] && missing+=("SSH_PRIVATE_KEY")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing required secrets in environment '${{ inputs.environment || 'production' }}':"
+            for s in "${missing[@]}"; do echo "::error::  - $s"; done
+            echo "::error::Set them under Settings → Environments → ${{ inputs.environment || 'production' }} → Secrets."
+            exit 1
+          fi
+
       - name: Download Docker image artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: docker-image
           path: /tmp
 
       - name: Setup SSH agent
-        uses: webfactory/ssh-agent@v0.9.0
+        uses: webfactory/ssh-agent@v0.10.0
         with:
           ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
           log-public-key: false
@@ -317,7 +331,7 @@ jobs:
             > .deployed-marker/info
 
       - name: Save cache
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: .deployed-marker
           key: fips-deployed-${{ needs.resolve.outputs.sha }}
