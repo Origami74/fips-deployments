@@ -85,7 +85,10 @@ jobs:
   # ---------------------------------------------------------------------------
   build:
     name: Build (${{ needs.resolve.outputs.sha }})
-    runs-on: ubuntu-latest
+    # Pinned to 22.04 (glibc 2.35) so binaries run on debian:bookworm-slim
+    # (glibc 2.36). ubuntu-latest = 24.04 produces binaries linked against
+    # glibc 2.39 which won't load in the runtime image.
+    runs-on: ubuntu-22.04
     needs: resolve
     if: needs.resolve.outputs.should_deploy == 'true'
     steps:
