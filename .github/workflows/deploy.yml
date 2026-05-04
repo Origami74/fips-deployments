@@ -232,6 +232,9 @@ jobs:
             exit 1
           fi
 
+          # Bind UDP/TCP to the public IP (not 0.0.0.0) so fips can publish a
+          # concrete reachable endpoint in its Nostr advert. Requires the
+          # container to use --network host (see "Deploy on remote server").
           {
             echo "node:"
             echo "  identity:"
@@ -252,13 +255,13 @@ jobs:
             echo ""
             echo "transports:"
             echo "  udp:"
-            echo "    bind_addr: \"0.0.0.0:2121\""
+            echo "    bind_addr: \"${DEPLOY_HOST}:2121\""
             echo "    mtu: 1472"
             echo "    advertise_on_nostr: true"
             echo "    public: true"
             echo "  tcp:"
-            echo "    public:"
-            echo "      bind_addr: \"0.0.0.0:443\""
+            echo "    bind_addr: \"${DEPLOY_HOST}:443\""
+            echo "    advertise_on_nostr: true"
           } > /tmp/fips.yaml
 
           if [ -n "$PEERS" ]; then
@@ -311,14 +314,17 @@ jobs:
           sudo rm -f /tmp/fips.yaml
 
           echo "--- Starting container..."
+          # --network host: required so the container can bind directly to
+          # the host's public IP (fips needs a concrete reachable address
+          # for its Nostr advert; bridge networking would only expose the
+          # container's private IP). Drops the need for -p port mappings.
           sudo docker run -d \
               --name "$CONTAINER_NAME" \
               --restart unless-stopped \
               --cap-add NET_ADMIN \
               --device /dev/net/tun:/dev/net/tun \
+              --network host \
               --sysctl net.ipv6.conf.all.disable_ipv6=0 \
-              -p 2121:2121/udp \
-              -p 443:443/tcp \
               -v "$CONFIG_DIR/fips.yaml:/etc/fips/fips.yaml:ro" \
               "$IMAGE_NAME:$IMAGE_TAG"
 
