@@ -4,9 +4,9 @@ name: Deploy FIPS Nodes
 # packages it into a Docker image, and deploys to all servers in the matrix.
 #
 # Triggers:
-#   - push to master       → deploy jmcorgan/fips@master to production (skips if SHA unchanged)
-#   - schedule (hourly)    → poll jmcorgan/fips@master, deploy if SHA changed
-#   - workflow_dispatch    → manual; ALWAYS builds + deploys (bypasses SHA cache)
+#   - push to master       → ALWAYS builds + deploys (cache bypassed)
+#   - workflow_dispatch    → ALWAYS builds + deploys (cache bypassed)
+#   - schedule (hourly)    → polls jmcorgan/fips@master; deploys only if SHA changed
 
 on:
   push:
@@ -69,16 +69,21 @@ jobs:
       - name: Decide whether to deploy
         id: decide
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "should_deploy=true" >> "$GITHUB_OUTPUT"
-            echo "Manual dispatch — forcing deploy"
-          elif [ "${{ steps.cache.outputs.cache-hit }}" = "true" ]; then
-            echo "should_deploy=false" >> "$GITHUB_OUTPUT"
-            echo "SHA ${{ steps.sha.outputs.sha }} already deployed — skipping"
-          else
-            echo "should_deploy=true" >> "$GITHUB_OUTPUT"
-            echo "New SHA ${{ steps.sha.outputs.sha }} — will build and deploy"
-          fi
+          case "${{ github.event_name }}" in
+            workflow_dispatch|push)
+              echo "should_deploy=true" >> "$GITHUB_OUTPUT"
+              echo "${{ github.event_name }} — forcing deploy (cache bypassed)"
+              ;;
+            *)
+              if [ "${{ steps.cache.outputs.cache-hit }}" = "true" ]; then
+                echo "should_deploy=false" >> "$GITHUB_OUTPUT"
+                echo "SHA ${{ steps.sha.outputs.sha }} already deployed — skipping"
+              else
+                echo "should_deploy=true" >> "$GITHUB_OUTPUT"
+                echo "New SHA ${{ steps.sha.outputs.sha }} — will build and deploy"
+              fi
+              ;;
+          esac
 
   # ---------------------------------------------------------------------------
   # Job 2 – Check out fips at the resolved SHA, build binary, build Docker image
