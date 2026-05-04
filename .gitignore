@@ -1,0 +1,17 @@
+# Secrets — never commit these
+.act.secrets
+
+# macOS
+.DS_Store
+
+# Editor/IDE
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Compiled binaries staged into the Docker build context (added by CI)
+docker/fips
+docker/fipsctl
+docker/fipstop

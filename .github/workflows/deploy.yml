@@ -1,0 +1,242 @@
+name: Deploy FIPS Nodes
+
+# Builds the fips binary from a specific ref/tag of the fips source repo,
+# packages it into a Docker image, and deploys to all servers in the matrix.
+#
+# Trigger manually via workflow_dispatch, specifying the fips version to deploy.
+
+on:
+  workflow_dispatch:
+    inputs:
+      fips_ref:
+        description: "fips source ref to build (tag, branch, or commit SHA)"
+        required: true
+        default: "main"
+      environment:
+        description: "Deployment environment"
+        type: choice
+        options:
+          - production
+          - staging
+        default: production
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+  IMAGE_NAME: fips-node
+  IMAGE_TAG: latest
+  FIPS_REPO: fips-network/fips
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1 – Check out fips at the requested ref, build binary, build Docker image
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build (${{ inputs.fips_ref }})
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out fips source at ${{ inputs.fips_ref }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FIPS_REPO }}
+          ref: ${{ inputs.fips_ref }}
+          path: fips-src
+
+      - name: Check out fips-deployments (this repo) for the Dockerfile
+        uses: actions/checkout@v4
+        with:
+          path: fips-deployments
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fips-src/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('fips-src/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build FIPS binary
+        run: cargo build --release
+        working-directory: fips-src
+
+      - name: Stage binaries into Docker build context
+        run: |
+          cp fips-src/target/release/fips    fips-deployments/docker/fips
+          cp fips-src/target/release/fipsctl fips-deployments/docker/fipsctl
+          cp fips-src/target/release/fipstop fips-deployments/docker/fipstop
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        run: docker build --platform linux/amd64 -t ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} fips-deployments/docker
+
+      - name: Save Docker image as tarball
+        run: |
+          docker save ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} | gzip > /tmp/fips-node.tar.gz
+          ls -lh /tmp/fips-node.tar.gz
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp/fips-node.tar.gz
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Job 2 – Deploy to each server in the matrix
+  #
+  # Single-entry matrix for now. The "Resolve *" case-statement pattern
+  # (needed because GitHub Actions does not support dynamic secret lookup like
+  # ${{ secrets[var] }}) is omitted — secrets are referenced directly. To add
+  # more servers, restore the resolve-step pattern from git history.
+  #
+  # Required secrets:
+  #   SSH_PRIVATE_KEY              — SSH private key
+  #   DEPLOY_USER_FIPS_PROD_US_1   — SSH login user
+  #   DEPLOY_HOST_FIPS_PROD_US_1   — hostname or IP
+  #   NSEC_FIPS_PROD_US_1          — 64-char hex nsec
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    needs: build
+    environment: ${{ inputs.environment }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: FIPS_PROD_US_1
+            # Comma-separated peers, each formatted as: npub|ip|port
+            peers: ""
+
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST_FIPS_PROD_US_1 }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER_FIPS_PROD_US_1 }}
+      NSEC_VALUE:  ${{ secrets.NSEC_FIPS_PROD_US_1 }}
+
+    steps:
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp
+
+      - name: Setup SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+          log-public-key: false
+
+      - name: Add host to known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Generate fips.yaml config
+        env:
+          PEERS: ${{ matrix.peers }}
+        run: |
+          if [ -z "$NSEC_VALUE" ]; then
+            echo "Error: nsec is empty" >&2
+            exit 1
+          fi
+
+          {
+            echo "node:"
+            echo "  identity:"
+            echo "    nsec: \"${NSEC_VALUE}\""
+            echo ""
+            echo "tun:"
+            echo "  enabled: true"
+            echo "  name: fips0"
+            echo "  mtu: 1280"
+            echo ""
+            echo "dns:"
+            echo "  enabled: true"
+            echo "  bind_addr: \"127.0.0.1\""
+            echo ""
+            echo "transports:"
+            echo "  udp:"
+            echo "    bind_addr: \"0.0.0.0:2121\""
+            echo "    mtu: 1472"
+            echo "  tcp:"
+            echo "    public:"
+            echo "      bind_addr: \"0.0.0.0:443\""
+          } > /tmp/fips.yaml
+
+          if [ -n "$PEERS" ]; then
+            echo "" >> /tmp/fips.yaml
+            echo "peers:" >> /tmp/fips.yaml
+            IFS=',' read -ra PEER_LIST <<< "$PEERS"
+            for peer in "${PEER_LIST[@]}"; do
+              peer=$(echo "$peer" | xargs)
+              [ -z "$peer" ] && continue
+              IFS='|' read -r npub ip port <<< "$peer"
+              echo "  - npub: \"${npub}\"" >> /tmp/fips.yaml
+              echo "    addresses:" >> /tmp/fips.yaml
+              echo "      - transport: udp" >> /tmp/fips.yaml
+              echo "        addr: \"${ip}:${port}\"" >> /tmp/fips.yaml
+            done
+          fi
+
+          echo "Generated config (nsec redacted):"
+          grep -v "nsec:" /tmp/fips.yaml
+
+      - name: Copy files to remote server
+        run: |
+          scp /tmp/fips-node.tar.gz /tmp/fips.yaml \
+            "${DEPLOY_USER}@${DEPLOY_HOST}:/tmp/"
+
+      - name: Deploy on remote server
+        run: |
+          ssh "${DEPLOY_USER}@${DEPLOY_HOST}" bash -s << 'REMOTE_SCRIPT'
+          set -euo pipefail
+
+          IMAGE_NAME="fips-node"
+          IMAGE_TAG="latest"
+          CONTAINER_NAME="fips-node"
+          CONFIG_DIR="/etc/fips"
+
+          echo "--- Stopping existing container (if any)..."
+          sudo docker stop "$CONTAINER_NAME" 2>/dev/null || true
+          sudo docker rm   "$CONTAINER_NAME" 2>/dev/null || true
+
+          echo "--- Removing old image (if any)..."
+          sudo docker rmi "$IMAGE_NAME:$IMAGE_TAG" 2>/dev/null || true
+
+          echo "--- Loading new image..."
+          sudo docker load < /tmp/fips-node.tar.gz
+          sudo rm -f /tmp/fips-node.tar.gz
+
+          echo "--- Installing config..."
+          sudo mkdir -p "$CONFIG_DIR"
+          sudo cp /tmp/fips.yaml "$CONFIG_DIR/fips.yaml"
+          sudo rm -f /tmp/fips.yaml
+
+          echo "--- Starting container..."
+          sudo docker run -d \
+              --name "$CONTAINER_NAME" \
+              --restart unless-stopped \
+              --cap-add NET_ADMIN \
+              --device /dev/net/tun:/dev/net/tun \
+              --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+              -p 2121:2121/udp \
+              -p 443:443/tcp \
+              -v "$CONFIG_DIR/fips.yaml:/etc/fips/fips.yaml:ro" \
+              "$IMAGE_NAME:$IMAGE_TAG"
+
+          echo "--- Container started:"
+          sudo docker ps --filter "name=$CONTAINER_NAME" --format "  {{.Names}}  {{.Status}}  {{.Ports}}"
+          REMOTE_SCRIPT
+
+      - name: Verify deployment
+        run: |
+          ssh "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "sudo docker ps --filter 'name=fips-node' --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'"
