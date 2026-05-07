@@ -158,18 +158,25 @@ jobs:
   # ---------------------------------------------------------------------------
   # Job 2 – Deploy to each server in the matrix
   #
-  # Single-entry matrix for now. The "Resolve *" case-statement pattern
-  # (needed because GitHub Actions does not support dynamic secret lookup like
-  # ${{ secrets[var] }}) is omitted — secrets are referenced directly. To add
-  # more servers, restore the resolve-step pattern from git history.
+  # GitHub Actions does not allow dynamic secret/var lookup
+  # (${{ secrets[matrix.x] }}). The "Resolve target" step works around this
+  # by exposing all per-server secrets/vars as job-level env, then a case
+  # statement keyed on matrix.name promotes the right ones into $GITHUB_ENV
+  # under the names DEPLOY_HOST / DEPLOY_USER / NSEC_VALUE so the rest of
+  # the job can use them directly.
   #
-  # Required (under environment "production"):
+  # Required (under environment "production"), per server:
   #   secrets:
-  #     SSH_PRIVATE_KEY              — SSH private key
-  #     NSEC_FIPS_PROD_US_1          — 64-char hex nsec
+  #     SSH_PRIVATE_KEY              — shared SSH private key
+  #     NSEC_FIPS_PROD_US_<N>        — 64-char hex nsec
   #   vars:
-  #     DEPLOY_USER_FIPS_PROD_US_1   — SSH login user
-  #     DEPLOY_HOST_FIPS_PROD_US_1   — hostname or IP
+  #     DEPLOY_USER_FIPS_PROD_US_<N> — SSH login user
+  #     DEPLOY_HOST_FIPS_PROD_US_<N> — public IP (must be a literal IP, not a hostname)
+  #
+  # Adding a new server:
+  #   1. Add a matrix entry below (just `name` + `peers`).
+  #   2. Add the three new vars/secret in GitHub.
+  #   3. Add a case branch in "Resolve target".
   # ---------------------------------------------------------------------------
   deploy:
     name: Deploy to ${{ matrix.name }}
@@ -185,24 +192,56 @@ jobs:
           - name: FIPS_PROD_US_1
             # Comma-separated peers, each formatted as: npub|ip|port
             peers: ""
-
-    env:
-      DEPLOY_HOST: ${{ vars.DEPLOY_HOST_FIPS_PROD_US_1 }}
-      DEPLOY_USER: ${{ vars.DEPLOY_USER_FIPS_PROD_US_1 }}
-      NSEC_VALUE:  ${{ secrets.NSEC_FIPS_PROD_US_1 }}
+          - name: FIPS_PROD_US_2
+            peers: ""
 
     steps:
+      - name: Resolve target (pick host/user/nsec for ${{ matrix.name }})
+        env:
+          HOST_1: ${{ vars.DEPLOY_HOST_FIPS_PROD_US_1 }}
+          HOST_2: ${{ vars.DEPLOY_HOST_FIPS_PROD_US_2 }}
+          USER_1: ${{ vars.DEPLOY_USER_FIPS_PROD_US_1 }}
+          USER_2: ${{ vars.DEPLOY_USER_FIPS_PROD_US_2 }}
+          NSEC_1: ${{ secrets.NSEC_FIPS_PROD_US_1 }}
+          NSEC_2: ${{ secrets.NSEC_FIPS_PROD_US_2 }}
+        run: |
+          case "${{ matrix.name }}" in
+            FIPS_PROD_US_1)
+              host="$HOST_1"; user="$USER_1"; nsec="$NSEC_1"
+              host_var="DEPLOY_HOST_FIPS_PROD_US_1"
+              user_var="DEPLOY_USER_FIPS_PROD_US_1"
+              nsec_secret="NSEC_FIPS_PROD_US_1"
+              ;;
+            FIPS_PROD_US_2)
+              host="$HOST_2"; user="$USER_2"; nsec="$NSEC_2"
+              host_var="DEPLOY_HOST_FIPS_PROD_US_2"
+              user_var="DEPLOY_USER_FIPS_PROD_US_2"
+              nsec_secret="NSEC_FIPS_PROD_US_2"
+              ;;
+            *)
+              echo "::error::Unknown matrix entry: ${{ matrix.name }}"; exit 1 ;;
+          esac
+          echo "DEPLOY_HOST=$host" >> "$GITHUB_ENV"
+          echo "DEPLOY_USER=$user" >> "$GITHUB_ENV"
+          echo "::add-mask::$nsec"
+          echo "NSEC_VALUE=$nsec" >> "$GITHUB_ENV"
+          # Expose the names of the missing config keys so the next step can
+          # name them in error messages.
+          echo "HOST_VAR=$host_var" >> "$GITHUB_ENV"
+          echo "USER_VAR=$user_var" >> "$GITHUB_ENV"
+          echo "NSEC_SECRET=$nsec_secret" >> "$GITHUB_ENV"
+
       - name: Validate required secrets are present
         run: |
           missing=()
-          [ -z "${DEPLOY_HOST}"  ] && missing+=("DEPLOY_HOST_FIPS_PROD_US_1")
-          [ -z "${DEPLOY_USER}"  ] && missing+=("DEPLOY_USER_FIPS_PROD_US_1")
-          [ -z "${NSEC_VALUE}"   ] && missing+=("NSEC_FIPS_PROD_US_1")
+          [ -z "${DEPLOY_HOST}"  ] && missing+=("$HOST_VAR")
+          [ -z "${DEPLOY_USER}"  ] && missing+=("$USER_VAR")
+          [ -z "${NSEC_VALUE}"   ] && missing+=("$NSEC_SECRET")
           [ -z "${{ secrets.SSH_PRIVATE_KEY }}" ] && missing+=("SSH_PRIVATE_KEY")
           if [ ${#missing[@]} -gt 0 ]; then
-            echo "::error::Missing required secrets in environment '${{ inputs.environment || 'production' }}':"
+            echo "::error::Missing required secrets/vars in environment '${{ inputs.environment || 'production' }}':"
             for s in "${missing[@]}"; do echo "::error::  - $s"; done
-            echo "::error::Set them under Settings → Environments → ${{ inputs.environment || 'production' }} → Secrets."
+            echo "::error::Set them under Settings → Environments → ${{ inputs.environment || 'production' }} (Secrets and/or Variables)."
             exit 1
           fi
 
