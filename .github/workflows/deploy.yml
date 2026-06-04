@@ -1,12 +1,26 @@
 name: Deploy FIPS Nodes
 
-# Builds the fips binary from a specific ref/tag of the fips source repo,
-# packages it into a Docker image, and deploys to all servers in the matrix.
+# Builds the fips binary from TWO source branches of the fips repo (master and
+# next), packages each into its own Docker image, and deploys both side by side
+# on every server in the host matrix:
+#
+#   master → container fips-node       UDP 2121 / TCP 443  TUN fips0  (dns + iperf + http)
+#   next   → container fips-node-next  UDP 2122 / TCP 444  TUN fips1  (fips only, dns off)
+#
+# Both containers run with --network host, so the next instance offsets every
+# public port by +1 and skips the auxiliary services (dnsmasq, the fips daemon
+# DNS resolver, iperf3, http.server) that would otherwise collide on the shared
+# host network namespace. The two instances reuse the SAME per-host nsec; `next`
+# defaults its Nostr discovery namespace to `fips-overlay-v1-next`, so the two
+# protocol versions stay on separate overlays despite sharing an identity.
 #
 # Triggers:
-#   - push to master       → ALWAYS builds + deploys (cache bypassed)
-#   - workflow_dispatch    → ALWAYS builds + deploys (cache bypassed)
-#   - schedule (hourly)    → polls jmcorgan/fips@master; deploys only if SHA changed
+#   - push to master       → ALWAYS builds + deploys both variants (cache bypassed)
+#   - workflow_dispatch    → ALWAYS builds + deploys both variants (cache bypassed)
+#   - schedule (hourly)    → polls jmcorgan/fips master AND next independently;
+#                            deploys only the variant(s) whose SHA changed since
+#                            the last successful deploy. master changing does not
+#                            redeploy next, and vice versa.
 
 on:
   push:
@@ -15,10 +29,6 @@ on:
     - cron: "0 * * * *"
   workflow_dispatch:
     inputs:
-      fips_ref:
-        description: "fips source ref to build (tag, branch, or commit SHA)"
-        required: true
-        default: "master"
       environment:
         description: "Deployment environment"
         type: choice
@@ -31,77 +41,119 @@ on:
 env:
   CARGO_TERM_COLOR: always
   IMAGE_NAME: fips-node
-  IMAGE_TAG: latest
   FIPS_REPO: jmcorgan/fips
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Job 1 – Resolve fips ref to SHA and decide whether to deploy
+  # Job 1 – Resolve master & next to SHAs and plan which variants to deploy
   #
-  # workflow_dispatch always deploys. Otherwise, look up the
-  # fips-deployed-<sha> cache: hit means we already shipped this SHA, skip.
+  # Each branch has its own deployment marker cache (fips-deployed-<variant>-<sha>).
+  # On schedule a variant deploys only on a marker miss (new SHA); push and
+  # workflow_dispatch force both (cache bypassed). The job emits two dynamic
+  # matrices consumed by the build and deploy jobs:
+  #   build_matrix : [{variant,branch,sha}, ...]  — one per variant to (re)build
+  #   deploy_matrix: [{name,variant}, ...]         — host × variant cross product
+  # An empty matrix ('[]') skips the corresponding job (no-op schedule run).
   # ---------------------------------------------------------------------------
   resolve:
-    name: Resolve & decide
+    name: Resolve & plan
     runs-on: ubuntu-latest
     outputs:
-      sha: ${{ steps.sha.outputs.sha }}
-      should_deploy: ${{ steps.decide.outputs.should_deploy }}
+      build_matrix: ${{ steps.plan.outputs.build_matrix }}
+      deploy_matrix: ${{ steps.plan.outputs.deploy_matrix }}
     steps:
-      - name: Resolve fips ref to commit SHA
+      - name: Resolve master & next to commit SHAs
         id: sha
         env:
           GH_TOKEN: ${{ github.token }}
-          REF: ${{ inputs.fips_ref || 'master' }}
         run: |
-          SHA=$(gh api "repos/${FIPS_REPO}/commits/${REF}" -q .sha)
-          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
-          echo "Resolved ${FIPS_REPO}@${REF} → ${SHA}"
+          MASTER_SHA=$(gh api "repos/${FIPS_REPO}/commits/master" -q .sha)
+          NEXT_SHA=$(gh api "repos/${FIPS_REPO}/commits/next" -q .sha)
+          echo "master_sha=${MASTER_SHA}" >> "$GITHUB_OUTPUT"
+          echo "next_sha=${NEXT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Resolved ${FIPS_REPO}@master → ${MASTER_SHA}"
+          echo "Resolved ${FIPS_REPO}@next   → ${NEXT_SHA}"
 
-      - name: Check deployment marker cache
-        id: cache
+      - name: Check master deployment marker
+        id: cache_master
         uses: actions/cache/restore@v5
         with:
           path: .deployed-marker
-          key: fips-deployed-${{ steps.sha.outputs.sha }}
+          key: fips-deployed-master-${{ steps.sha.outputs.master_sha }}
           lookup-only: true
 
-      - name: Decide whether to deploy
-        id: decide
+      - name: Check next deployment marker
+        id: cache_next
+        uses: actions/cache/restore@v5
+        with:
+          path: .deployed-marker
+          key: fips-deployed-next-${{ steps.sha.outputs.next_sha }}
+          lookup-only: true
+
+      - name: Plan build & deploy matrices
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          MASTER_SHA: ${{ steps.sha.outputs.master_sha }}
+          NEXT_SHA: ${{ steps.sha.outputs.next_sha }}
+          MASTER_HIT: ${{ steps.cache_master.outputs.cache-hit }}
+          NEXT_HIT: ${{ steps.cache_next.outputs.cache-hit }}
         run: |
-          case "${{ github.event_name }}" in
+          # Hosts that every active variant is deployed to.
+          HOSTS=(FIPS_PROD_US_1 FIPS_PROD_US_2)
+
+          # Decide per branch. push/workflow_dispatch force both (cache
+          # bypassed); schedule deploys a branch only when its SHA is new.
+          case "$EVENT" in
             workflow_dispatch|push)
-              echo "should_deploy=true" >> "$GITHUB_OUTPUT"
-              echo "${{ github.event_name }} — forcing deploy (cache bypassed)"
-              ;;
+              deploy_master=true; deploy_next=true
+              echo "$EVENT — forcing both variants (cache bypassed)" ;;
             *)
-              if [ "${{ steps.cache.outputs.cache-hit }}" = "true" ]; then
-                echo "should_deploy=false" >> "$GITHUB_OUTPUT"
-                echo "SHA ${{ steps.sha.outputs.sha }} already deployed — skipping"
-              else
-                echo "should_deploy=true" >> "$GITHUB_OUTPUT"
-                echo "New SHA ${{ steps.sha.outputs.sha }} — will build and deploy"
-              fi
-              ;;
+              [ "$MASTER_HIT" = "true" ] && deploy_master=false || deploy_master=true
+              [ "$NEXT_HIT"   = "true" ] && deploy_next=false   || deploy_next=true
+              echo "schedule — deploy master:${deploy_master} next:${deploy_next}" ;;
           esac
 
+          build='[]'
+          deploy='[]'
+          if [ "$deploy_master" = true ]; then
+            build=$(jq -c --arg s "$MASTER_SHA" '. += [{variant:"master",branch:"master",sha:$s}]' <<<"$build")
+          fi
+          if [ "$deploy_next" = true ]; then
+            build=$(jq -c --arg s "$NEXT_SHA" '. += [{variant:"next",branch:"next",sha:$s}]' <<<"$build")
+          fi
+          for h in "${HOSTS[@]}"; do
+            [ "$deploy_master" = true ] && deploy=$(jq -c --arg n "$h" '. += [{name:$n,variant:"master"}]' <<<"$deploy")
+            [ "$deploy_next"   = true ] && deploy=$(jq -c --arg n "$h" '. += [{name:$n,variant:"next"}]' <<<"$deploy")
+          done
+
+          echo "build_matrix=$build"   >> "$GITHUB_OUTPUT"
+          echo "deploy_matrix=$deploy" >> "$GITHUB_OUTPUT"
+          echo "build_matrix=$build"
+          echo "deploy_matrix=$deploy"
+
   # ---------------------------------------------------------------------------
-  # Job 2 – Check out fips at the resolved SHA, build binary, build Docker image
+  # Job 2 – Build each active variant: check out fips at the resolved SHA,
+  # build the binary, build the Docker image (tagged fips-node:<variant>).
   # ---------------------------------------------------------------------------
   build:
-    name: Build (${{ needs.resolve.outputs.sha }})
+    name: Build ${{ matrix.variant }} (${{ matrix.sha }})
     # Pinned to 22.04 (glibc 2.35) so binaries run on debian:bookworm-slim
     # (glibc 2.36). ubuntu-latest = 24.04 produces binaries linked against
     # glibc 2.39 which won't load in the runtime image.
     runs-on: ubuntu-22.04
     needs: resolve
-    if: needs.resolve.outputs.should_deploy == 'true'
+    if: needs.resolve.outputs.build_matrix != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.resolve.outputs.build_matrix) }}
     steps:
-      - name: Check out fips source at ${{ needs.resolve.outputs.sha }}
+      - name: Check out fips source (${{ matrix.branch }} @ ${{ matrix.sha }})
         uses: actions/checkout@v6
         with:
           repository: ${{ env.FIPS_REPO }}
-          ref: ${{ needs.resolve.outputs.sha }}
+          ref: ${{ matrix.sha }}
           path: fips-src
 
       - name: Check out fips-deployments (this repo) for the Dockerfile
@@ -124,8 +176,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             fips-src/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('fips-src/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-${{ matrix.variant }}-${{ hashFiles('fips-src/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.variant }}-
+            ${{ runner.os }}-cargo-
 
       - name: Build FIPS binary
         run: cargo build --release
@@ -141,59 +195,55 @@ jobs:
         uses: docker/setup-buildx-action@v4
 
       - name: Build Docker image
-        run: docker build --platform linux/amd64 -t ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} fips-deployments/docker
+        run: docker build --platform linux/amd64 -t ${{ env.IMAGE_NAME }}:${{ matrix.variant }} fips-deployments/docker
 
       - name: Save Docker image as tarball
         run: |
-          docker save ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} | gzip > /tmp/fips-node.tar.gz
+          docker save ${{ env.IMAGE_NAME }}:${{ matrix.variant }} | gzip > /tmp/fips-node.tar.gz
           ls -lh /tmp/fips-node.tar.gz
 
       - name: Upload Docker image artifact
         uses: actions/upload-artifact@v7
         with:
-          name: docker-image
+          name: docker-image-${{ matrix.variant }}
           path: /tmp/fips-node.tar.gz
           retention-days: 1
 
   # ---------------------------------------------------------------------------
-  # Job 2 – Deploy to each server in the matrix
+  # Job 3 – Deploy each (host × variant) pair.
   #
   # GitHub Actions does not allow dynamic secret/var lookup
   # (${{ secrets[matrix.x] }}). The "Resolve target" step works around this
   # by exposing all per-server secrets/vars as job-level env, then a case
   # statement keyed on matrix.name promotes the right ones into $GITHUB_ENV
-  # under the names DEPLOY_HOST / DEPLOY_USER / NSEC_VALUE so the rest of
-  # the job can use them directly.
+  # under the names DEPLOY_HOST / DEPLOY_USER / NSEC_VALUE. The same nsec is
+  # reused for both variants on a host. A second case (keyed on matrix.variant)
+  # sets the variant-specific ports / container name / TUN / entrypoint mode.
   #
   # Required (under environment "production"), per server:
   #   secrets:
   #     SSH_PRIVATE_KEY              — shared SSH private key
-  #     NSEC_FIPS_PROD_US_<N>        — 64-char hex nsec
+  #     NSEC_FIPS_PROD_US_<N>        — 64-char hex nsec (shared by both variants)
   #   vars:
   #     DEPLOY_USER_FIPS_PROD_US_<N> — SSH login user
   #     DEPLOY_HOST_FIPS_PROD_US_<N> — public IP (must be a literal IP, not a hostname)
   #
   # Adding a new server:
-  #   1. Add a matrix entry below (just `name` + `peers`).
+  #   1. Add the host id to HOSTS in the "Plan" step above.
   #   2. Add the three new vars/secret in GitHub.
   #   3. Add a case branch in "Resolve target".
   # ---------------------------------------------------------------------------
   deploy:
-    name: Deploy to ${{ matrix.name }}
+    name: Deploy ${{ matrix.variant }} → ${{ matrix.name }}
     runs-on: ubuntu-latest
     needs: [resolve, build]
-    if: needs.resolve.outputs.should_deploy == 'true'
+    if: needs.resolve.outputs.deploy_matrix != '[]'
     environment: ${{ inputs.environment || 'production' }}
 
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: FIPS_PROD_US_1
-            # Comma-separated peers, each formatted as: npub|ip|port
-            peers: ""
-          - name: FIPS_PROD_US_2
-            peers: ""
+        include: ${{ fromJSON(needs.resolve.outputs.deploy_matrix) }}
 
     steps:
       - name: Resolve target (pick host/user/nsec for ${{ matrix.name }})
@@ -231,6 +281,43 @@ jobs:
           echo "USER_VAR=$user_var" >> "$GITHUB_ENV"
           echo "NSEC_SECRET=$nsec_secret" >> "$GITHUB_ENV"
 
+      - name: Resolve variant params (${{ matrix.variant }})
+        run: |
+          case "${{ matrix.variant }}" in
+            master)
+              echo "IMAGE_TAG=master"            >> "$GITHUB_ENV"
+              echo "CONTAINER_NAME=fips-node"     >> "$GITHUB_ENV"
+              echo "UDP_PORT=2121"                >> "$GITHUB_ENV"
+              echo "TCP_PORT=443"                 >> "$GITHUB_ENV"
+              echo "TUN_NAME=fips0"               >> "$GITHUB_ENV"
+              echo "DNS_ENABLED=true"             >> "$GITHUB_ENV"
+              echo "ENTRYPOINT_MODE=default"      >> "$GITHUB_ENV"
+              ;;
+            next)
+              # +1 on every public port; distinct TUN; fips' own DNS resolver
+              # disabled and the image's auxiliary services skipped so the two
+              # containers don't collide on the shared --network host stack.
+              echo "IMAGE_TAG=next"                >> "$GITHUB_ENV"
+              echo "CONTAINER_NAME=fips-node-next"  >> "$GITHUB_ENV"
+              echo "UDP_PORT=2122"                 >> "$GITHUB_ENV"
+              echo "TCP_PORT=444"                  >> "$GITHUB_ENV"
+              echo "TUN_NAME=fips1"                >> "$GITHUB_ENV"
+              echo "DNS_ENABLED=false"             >> "$GITHUB_ENV"
+              echo "ENTRYPOINT_MODE=fips-only"     >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "::error::Unknown variant: ${{ matrix.variant }}"; exit 1 ;;
+          esac
+
+      - name: Resolve peers for ${{ matrix.name }}/${{ matrix.variant }}
+        run: |
+          # Per (host/variant) static peers, comma-separated as npub|ip|port.
+          # Default: none. Add a case branch here to seed bootstrap peers.
+          case "${{ matrix.name }}/${{ matrix.variant }}" in
+            *) PEERS="" ;;
+          esac
+          echo "PEERS=$PEERS" >> "$GITHUB_ENV"
+
       - name: Validate required secrets are present
         run: |
           missing=()
@@ -248,7 +335,7 @@ jobs:
       - name: Download Docker image artifact
         uses: actions/download-artifact@v8
         with:
-          name: docker-image
+          name: docker-image-${{ matrix.variant }}
           path: /tmp
 
       - name: Setup SSH agent
@@ -262,14 +349,14 @@ jobs:
           mkdir -p ~/.ssh
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
 
-      - name: Generate fips.yaml config
-        env:
-          PEERS: ${{ matrix.peers }}
+      - name: Generate fips config
         run: |
           if [ -z "$NSEC_VALUE" ]; then
             echo "Error: nsec is empty" >&2
             exit 1
           fi
+
+          CFG="/tmp/${CONTAINER_NAME}.yaml"
 
           # Bind UDP/TCP to the public IP (not 0.0.0.0) so fips can publish a
           # concrete reachable endpoint in its Nostr advert. Requires the
@@ -278,6 +365,8 @@ jobs:
             echo "node:"
             echo "  identity:"
             echo "    nsec: \"${NSEC_VALUE}\""
+            echo "  limits:"
+            echo "    max_peers: 512"
             echo "  discovery:"
             echo "    nostr:"
             echo "      enabled: true"
@@ -285,58 +374,64 @@ jobs:
             echo ""
             echo "tun:"
             echo "  enabled: true"
-            echo "  name: fips0"
+            echo "  name: ${TUN_NAME}"
             echo "  mtu: 1280"
             echo ""
             echo "dns:"
-            echo "  enabled: true"
+            echo "  enabled: ${DNS_ENABLED}"
             echo "  bind_addr: \"127.0.0.1\""
             echo ""
             echo "transports:"
             echo "  udp:"
-            echo "    bind_addr: \"${DEPLOY_HOST}:2121\""
+            echo "    bind_addr: \"${DEPLOY_HOST}:${UDP_PORT}\""
             echo "    mtu: 1472"
             echo "    advertise_on_nostr: true"
             echo "    public: true"
             echo "  tcp:"
-            echo "    bind_addr: \"${DEPLOY_HOST}:443\""
+            echo "    bind_addr: \"${DEPLOY_HOST}:${TCP_PORT}\""
             echo "    advertise_on_nostr: true"
-          } > /tmp/fips.yaml
+          } > "$CFG"
 
           if [ -n "$PEERS" ]; then
-            echo "" >> /tmp/fips.yaml
-            echo "peers:" >> /tmp/fips.yaml
+            echo "" >> "$CFG"
+            echo "peers:" >> "$CFG"
             IFS=',' read -ra PEER_LIST <<< "$PEERS"
             for peer in "${PEER_LIST[@]}"; do
               peer=$(echo "$peer" | xargs)
               [ -z "$peer" ] && continue
               IFS='|' read -r npub ip port <<< "$peer"
-              echo "  - npub: \"${npub}\"" >> /tmp/fips.yaml
-              echo "    addresses:" >> /tmp/fips.yaml
-              echo "      - transport: udp" >> /tmp/fips.yaml
-              echo "        addr: \"${ip}:${port}\"" >> /tmp/fips.yaml
+              echo "  - npub: \"${npub}\"" >> "$CFG"
+              echo "    addresses:" >> "$CFG"
+              echo "      - transport: udp" >> "$CFG"
+              echo "        addr: \"${ip}:${port}\"" >> "$CFG"
             done
           fi
 
-          echo "Generated config (nsec redacted):"
-          grep -v "nsec:" /tmp/fips.yaml
+          echo "Generated ${CONTAINER_NAME} config (nsec redacted):"
+          grep -v "nsec:" "$CFG"
 
       - name: Copy files to remote server
         run: |
-          scp /tmp/fips-node.tar.gz /tmp/fips.yaml \
-            "${DEPLOY_USER}@${DEPLOY_HOST}:/tmp/"
+          scp /tmp/fips-node.tar.gz \
+            "${DEPLOY_USER}@${DEPLOY_HOST}:/tmp/fips-node-${IMAGE_TAG}.tar.gz"
+          scp "/tmp/${CONTAINER_NAME}.yaml" \
+            "${DEPLOY_USER}@${DEPLOY_HOST}:/tmp/${CONTAINER_NAME}.yaml"
 
       - name: Deploy on remote server
         run: |
-          ssh "${DEPLOY_USER}@${DEPLOY_HOST}" bash -s << 'REMOTE_SCRIPT'
+          ssh "${DEPLOY_USER}@${DEPLOY_HOST}" bash -s -- \
+            "$IMAGE_TAG" "$CONTAINER_NAME" "$ENTRYPOINT_MODE" << 'REMOTE_SCRIPT'
           set -euo pipefail
 
           IMAGE_NAME="fips-node"
-          IMAGE_TAG="latest"
-          CONTAINER_NAME="fips-node"
+          IMAGE_TAG="$1"
+          CONTAINER_NAME="$2"
+          ENTRYPOINT_MODE="$3"
           CONFIG_DIR="/etc/fips"
+          TARBALL="/tmp/fips-node-${IMAGE_TAG}.tar.gz"
+          CONFIG_SRC="/tmp/${CONTAINER_NAME}.yaml"
 
-          echo "--- Stopping existing container (if any)..."
+          echo "--- [$CONTAINER_NAME] Stopping existing container (if any)..."
           sudo docker stop "$CONTAINER_NAME" 2>/dev/null || true
           sudo docker rm   "$CONTAINER_NAME" 2>/dev/null || true
 
@@ -344,13 +439,13 @@ jobs:
           sudo docker rmi "$IMAGE_NAME:$IMAGE_TAG" 2>/dev/null || true
 
           echo "--- Loading new image..."
-          sudo docker load < /tmp/fips-node.tar.gz
-          sudo rm -f /tmp/fips-node.tar.gz
+          sudo docker load < "$TARBALL"
+          sudo rm -f "$TARBALL"
 
           echo "--- Installing config..."
           sudo mkdir -p "$CONFIG_DIR"
-          sudo cp /tmp/fips.yaml "$CONFIG_DIR/fips.yaml"
-          sudo rm -f /tmp/fips.yaml
+          sudo cp "$CONFIG_SRC" "$CONFIG_DIR/${CONTAINER_NAME}.yaml"
+          sudo rm -f "$CONFIG_SRC"
 
           echo "--- Starting container..."
           # --network host: required so the container can bind directly to
@@ -361,14 +456,26 @@ jobs:
           # (those sysctls live in the network namespace). The host's IPv6
           # setting now applies directly; ensure IPv6 is enabled on the host
           # if needed (sysctl net.ipv6.conf.all.disable_ipv6=0).
-          sudo docker run -d \
-              --name "$CONTAINER_NAME" \
-              --restart unless-stopped \
-              --cap-add NET_ADMIN \
-              --device /dev/net/tun:/dev/net/tun \
-              --network host \
-              -v "$CONFIG_DIR/fips.yaml:/etc/fips/fips.yaml:ro" \
-              "$IMAGE_NAME:$IMAGE_TAG"
+          run_args=(
+            -d
+            --name "$CONTAINER_NAME"
+            --restart unless-stopped
+            --cap-add NET_ADMIN
+            --device /dev/net/tun:/dev/net/tun
+            --network host
+            -v "$CONFIG_DIR/${CONTAINER_NAME}.yaml:/etc/fips/fips.yaml:ro"
+          )
+          if [ "$ENTRYPOINT_MODE" = "fips-only" ]; then
+            # next runs alongside master under --network host: skip the image's
+            # default entrypoint (dnsmasq + iperf3 + http.server + fips) and run
+            # fips alone so the shared ports 53/5354/5201/8000 don't collide.
+            sudo docker run "${run_args[@]}" \
+              --entrypoint /bin/bash \
+              "$IMAGE_NAME:$IMAGE_TAG" \
+              -c "exec fips --config /etc/fips/fips.yaml"
+          else
+            sudo docker run "${run_args[@]}" "$IMAGE_NAME:$IMAGE_TAG"
+          fi
 
           echo "--- Container started:"
           sudo docker ps --filter "name=$CONTAINER_NAME" --format "  {{.Names}}  {{.Status}}  {{.Ports}}"
@@ -377,25 +484,30 @@ jobs:
       - name: Verify deployment
         run: |
           ssh "${DEPLOY_USER}@${DEPLOY_HOST}" \
-            "sudo docker ps --filter 'name=fips-node' --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'"
+            "sudo docker ps --filter 'name=${CONTAINER_NAME}' --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'"
 
   # ---------------------------------------------------------------------------
-  # Job 3 – Save the deployment marker so future runs short-circuit on this SHA
+  # Job 4 – Save a per-variant deployment marker so future scheduled runs
+  # short-circuit on an unchanged branch SHA. Only runs if every deploy leg
+  # succeeded (if: success()), so a failed host blocks marking the variant.
   # ---------------------------------------------------------------------------
   save-marker:
-    name: Save deployment marker
+    name: Save ${{ matrix.variant }} marker
     runs-on: ubuntu-latest
     needs: [resolve, deploy]
-    if: needs.resolve.outputs.should_deploy == 'true' && success()
+    if: needs.resolve.outputs.build_matrix != '[]' && success()
+    strategy:
+      matrix:
+        include: ${{ fromJSON(needs.resolve.outputs.build_matrix) }}
     steps:
       - name: Write marker file
         run: |
           mkdir -p .deployed-marker
-          echo "${{ needs.resolve.outputs.sha }} deployed at $(date -u +%FT%TZ)" \
+          echo "${{ matrix.variant }} ${{ matrix.sha }} deployed at $(date -u +%FT%TZ)" \
             > .deployed-marker/info
 
       - name: Save cache
         uses: actions/cache/save@v5
         with:
           path: .deployed-marker
-          key: fips-deployed-${{ needs.resolve.outputs.sha }}
+          key: fips-deployed-${{ matrix.variant }}-${{ matrix.sha }}
