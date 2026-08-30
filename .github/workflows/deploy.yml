@@ -379,7 +379,7 @@ jobs:
             echo ""
             echo "dns:"
             echo "  enabled: ${DNS_ENABLED}"
-            echo "  bind_addr: \"127.0.0.1\""
+            echo "  bind_addr: \"::1\""
             echo ""
             echo "transports:"
             echo "  udp:"
