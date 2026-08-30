@@ -1,11 +1,15 @@
 name: Deploy FIPS Nodes
 
-# Builds the fips binary from TWO source branches of the fips repo (master and
-# next), packages each into its own Docker image, and deploys both side by side
-# on every server in the host matrix:
+# Builds the fips binary from the fips repo and deploys it to every server in
+# the host matrix. The workflow supports TWO source-branch variants (master and
+# next), each packaged into its own Docker image:
 #
 #   master → container fips-node       UDP 2121 / TCP 443  TUN fips0  (dns + iperf + http)
 #   next   → container fips-node-next  UDP 2122 / TCP 444  TUN fips1  (fips only, dns off)
+#
+# The `next` variant is currently DISABLED via the DEPLOY_NEXT env flag below:
+# it is not resolved, built or deployed, and any fips-node-next container still
+# running on a host is left alone. Set DEPLOY_NEXT to "true" to re-enable it.
 #
 # Both containers run with --network host, so the next instance offsets every
 # public port by +1 and skips the auxiliary services (dnsmasq, the fips daemon
@@ -15,9 +19,9 @@ name: Deploy FIPS Nodes
 # protocol versions stay on separate overlays despite sharing an identity.
 #
 # Triggers:
-#   - push to master       → ALWAYS builds + deploys both variants (cache bypassed)
-#   - workflow_dispatch    → ALWAYS builds + deploys both variants (cache bypassed)
-#   - schedule (hourly)    → polls jmcorgan/fips master AND next independently;
+#   - push to master       → ALWAYS builds + deploys every enabled variant (cache bypassed)
+#   - workflow_dispatch    → ALWAYS builds + deploys every enabled variant (cache bypassed)
+#   - schedule (hourly)    → polls each enabled branch independently;
 #                            deploys only the variant(s) whose SHA changed since
 #                            the last successful deploy. master changing does not
 #                            redeploy next, and vice versa.
@@ -42,6 +46,10 @@ env:
   CARGO_TERM_COLOR: always
   IMAGE_NAME: fips-node
   FIPS_REPO: jmcorgan/fips
+  # Master kill-switch for the `next` variant. While "false" nothing for next
+  # is resolved, built or deployed; already-running fips-node-next containers
+  # on the hosts are left untouched. Flip to "true" to re-enable.
+  DEPLOY_NEXT: "false"
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -68,11 +76,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           MASTER_SHA=$(gh api "repos/${FIPS_REPO}/commits/master" -q .sha)
-          NEXT_SHA=$(gh api "repos/${FIPS_REPO}/commits/next" -q .sha)
           echo "master_sha=${MASTER_SHA}" >> "$GITHUB_OUTPUT"
-          echo "next_sha=${NEXT_SHA}" >> "$GITHUB_OUTPUT"
           echo "Resolved ${FIPS_REPO}@master → ${MASTER_SHA}"
-          echo "Resolved ${FIPS_REPO}@next   → ${NEXT_SHA}"
+
+          if [ "${DEPLOY_NEXT}" = "true" ]; then
+            NEXT_SHA=$(gh api "repos/${FIPS_REPO}/commits/next" -q .sha)
+            echo "Resolved ${FIPS_REPO}@next   → ${NEXT_SHA}"
+          else
+            NEXT_SHA=""
+            echo "next variant disabled (DEPLOY_NEXT=${DEPLOY_NEXT}) — skipping"
+          fi
+          echo "next_sha=${NEXT_SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Check master deployment marker
         id: cache_master
@@ -84,6 +98,7 @@ jobs:
 
       - name: Check next deployment marker
         id: cache_next
+        if: env.DEPLOY_NEXT == 'true'
         uses: actions/cache/restore@v5
         with:
           path: .deployed-marker
@@ -113,6 +128,12 @@ jobs:
               [ "$NEXT_HIT"   = "true" ] && deploy_next=false   || deploy_next=true
               echo "schedule — deploy master:${deploy_master} next:${deploy_next}" ;;
           esac
+
+          # Kill-switch wins over every event type.
+          if [ "${DEPLOY_NEXT}" != "true" ]; then
+            deploy_next=false
+            echo "next variant disabled (DEPLOY_NEXT=${DEPLOY_NEXT})"
+          fi
 
           build='[]'
           deploy='[]'
