@@ -30,7 +30,7 @@ Both containers run with `--network host`, so the `next` instance offsets every 
 
 1. **Resolve & plan** — resolves both `master` and `next` to commit SHAs and consults a per-variant marker cache. Each branch deploys independently: a scheduled run rebuilds a variant only when *that* branch's SHA changed (master changing does not redeploy next, and vice versa); `push`/`workflow_dispatch` force both.
 2. **Build** — for each active variant, checks out `fips` at the resolved SHA, builds with `cargo build --release` (the CI runner is Linux x86_64), and packages it into a Docker image tagged `fips-node:<variant>`.
-3. **Deploy** — for each (host × active variant) pair, generates a config (`max_peers: 512`, the node's `nsec` from secrets, Nostr advertising on, and the variant's ports/TUN/DNS settings), copies the image and config over SSH, and starts the container.
+3. **Deploy** — for each (host × active variant) pair, generates a config (`max_peers: 256`, the node's `nsec` from secrets, Nostr advertising on, and the variant's ports/TUN/DNS settings), copies the image and config over SSH, and starts the container.
 
 ## Triggering a deployment
 

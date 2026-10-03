@@ -387,7 +387,7 @@ jobs:
             echo "  identity:"
             echo "    nsec: \"${NSEC_VALUE}\""
             echo "  limits:"
-            echo "    max_peers: 512"
+            echo "    max_peers: 256"
             echo "  discovery:"
             echo "    nostr:"
             echo "      enabled: true"
