@@ -411,6 +411,10 @@ jobs:
             echo "  tcp:"
             echo "    bind_addr: \"${DEPLOY_HOST}:${TCP_PORT}\""
             echo "    advertise_on_nostr: true"
+            # fips awaits msg2 sends inline in its rx loop; a TCP
+            # connect-on-send back to a NATed inbound peer blocks the whole
+            # node for the connect timeout (default 5000ms). Keep it short.
+            echo "    connect_timeout_ms: 300"
           } > "$CFG"
 
           if [ -n "$PEERS" ]; then
